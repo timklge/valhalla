@@ -65,6 +65,10 @@ enum class LandmarkType : uint8_t {
 constexpr uint8_t LandmarkTypeFirstValue = static_cast<uint8_t>(LandmarkType::fuel);
 constexpr uint8_t LandmarkTypeLastValue = static_cast<uint8_t>(LandmarkType::casino);
 
+inline constexpr bool is_valid_landmark_type(const uint8_t type) {
+  return type >= LandmarkTypeFirstValue && type <= LandmarkTypeLastValue;
+}
+
 inline LandmarkType string_to_landmark_type(const std::string& s) {
   static const std::unordered_map<std::string, LandmarkType> string_to_landmark_type =
       {{"restaurant", LandmarkType::restaurant},
@@ -123,7 +127,7 @@ struct Landmark {
     name = str.substr(9);
 
     // and that the type is valid
-    if (str[8] < LandmarkTypeFirstValue || str[8] > LandmarkTypeLastValue) {
+    if (!is_valid_landmark_type(static_cast<uint8_t>(str[8]))) {
       throw std::logic_error("Invalid landmark type");
     }
     type = static_cast<LandmarkType>(str[8]);

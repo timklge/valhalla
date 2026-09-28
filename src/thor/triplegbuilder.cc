@@ -533,6 +533,13 @@ void AddLandmarks(const EdgeInfo& edgeinfo,
 
   const auto landmark_range = edgeinfo.GetTags().equal_range(baldr::TaggedValue::kLandmark);
   for (auto it = landmark_range.first; it != landmark_range.second; ++it) {
+    if (it->second.size() > sizeof(uint64_t)) {
+      const auto type = static_cast<uint8_t>(it->second[sizeof(uint64_t)]);
+      if (!is_valid_landmark_type(type)) {
+        continue;
+      }
+    }
+
     Landmark lan(it->second);
     PointLL landmark_point = {lan.lng, lan.lat};
 

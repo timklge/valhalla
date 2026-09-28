@@ -19,6 +19,13 @@ using namespace valhalla::gurka;
 using namespace valhalla::midgard;
 using namespace valhalla::mjolnir;
 
+TEST(LandmarkTest, ValidatesTypeValues) {
+  EXPECT_FALSE(is_valid_landmark_type(0));
+  EXPECT_TRUE(is_valid_landmark_type(LandmarkTypeFirstValue));
+  EXPECT_TRUE(is_valid_landmark_type(LandmarkTypeLastValue));
+  EXPECT_FALSE(is_valid_landmark_type(static_cast<uint8_t>(LandmarkTypeLastValue + 1)));
+}
+
 // config for the first three tests
 const std::string workdir = VALHALLA_BUILD_DIR "test/data/landmarks/landmarks";
 const std::string db_path = workdir + "/landmarks.sqlite";
