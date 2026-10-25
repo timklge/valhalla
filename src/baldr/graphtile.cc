@@ -11,8 +11,10 @@
 #include "midgard/tiles.h"
 #include "midgard/util.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -50,6 +52,163 @@ public:
 private:
   const std::vector<char> memory_;
 };
+
+namespace {
+
+uint32_t read_u32(const char* p) {
+  uint32_t value;
+  std::memcpy(&value, p, sizeof(value));
+  return value;
+}
+
+uint64_t read_u64(const char* p) {
+  uint64_t value;
+  std::memcpy(&value, p, sizeof(value));
+  return value;
+}
+
+void write_u32(char* p, uint32_t value) {
+  std::memcpy(p, &value, sizeof(value));
+}
+
+void write_u64(char* p, uint64_t value) {
+  std::memcpy(p, &value, sizeof(value));
+}
+
+size_t directededge_offset(const GraphTileHeader& header) {
+  return sizeof(GraphTileHeader) + header.nodecount() * sizeof(NodeInfo) +
+         header.transitioncount() * sizeof(NodeTransition);
+}
+
+bool is_karoo_tile(const GraphTileHeader& header, const char* tile, size_t tile_size) {
+  const size_t de_offset = directededge_offset(header);
+  const size_t de_count = header.directededgecount();
+  if (de_offset > tile_size || de_count > (tile_size - de_offset) / sizeof(DirectedEdge)) {
+    return false;
+  }
+
+  const size_t edgeinfo_offset = header.edgeinfo_offset();
+  if (edgeinfo_offset > tile_size) {
+    return false;
+  }
+
+  size_t fork_elevation = 0;
+  size_t upstream_elevation = 0;
+  bool custom_edge_flag = false;
+  for (size_t i = 0; i < de_count; ++i) {
+    const char* edge = tile + de_offset + i * sizeof(DirectedEdge);
+    const uint64_t word1 = read_u64(edge + 8);
+    const uint64_t edgeinfo =
+        static_cast<uint64_t>(edgeinfo_offset) + (word1 & ((1u << 25) - 1));
+    if (edgeinfo + sizeof(EdgeInfo::EdgeInfoInner) <= tile_size) {
+      const uint32_t word = read_u32(tile + edgeinfo + 8);
+      fork_elevation += (word >> 29) & 1;
+      upstream_elevation += (word >> 30) & 1;
+    }
+    const uint64_t word4 = read_u64(edge + 24);
+    custom_edge_flag |= (word1 & ((1ull << 36) | (1ull << 48))) != 0;
+    custom_edge_flag |= (word4 & (3ull << 61)) != 0;
+  }
+
+  if (fork_elevation != upstream_elevation) {
+    return fork_elevation > upstream_elevation;
+  }
+  if (custom_edge_flag) {
+    return true;
+  }
+
+  size_t karoo_flags = 0;
+  for (uint32_t i = 0; i < header.nodecount(); ++i) {
+    const uint64_t word = read_u64(tile + sizeof(GraphTileHeader) + i * sizeof(NodeInfo) + 16);
+    if ((word & (1ull << 63)) != 0) {
+      return true;
+    }
+    const uint64_t current_elevation = (word >> 47) & 0x7fff;
+    if (((word >> 59) & 7) != 0 && (current_elevation & 0xfff) == 0) {
+      ++karoo_flags;
+    }
+  }
+  return karoo_flags > 0 && karoo_flags * 100 >= header.nodecount() * 2;
+}
+
+void convert_karoo_tile(char* tile, size_t tile_size) {
+  auto* header = reinterpret_cast<GraphTileHeader*>(tile);
+
+  header->set_bounding_circle_offset(0);
+  header->set_raw_checksum(0);
+
+  char* nodes = tile + sizeof(GraphTileHeader);
+  for (uint32_t i = 0; i < header->nodecount(); ++i) {
+    char* node = nodes + i * sizeof(NodeInfo) + 16;
+    const uint64_t word = read_u64(node);
+    const uint64_t elevation = (word >> 44) & 0x7fff;
+    const uint64_t tagged_access = (word >> 59) & 1;
+    const uint64_t private_access = (word >> 60) & 1;
+    const uint64_t cash_only_toll = (word >> 61) & 1;
+    const uint64_t timezone_ext_1 = (word >> 62) & 1;
+
+    uint64_t converted = word & ((1ull << 44) - 1);
+    converted |= tagged_access << 44;
+    converted |= private_access << 45;
+    converted |= cash_only_toll << 46;
+    converted |= elevation << 47;
+    converted |= timezone_ext_1 << 62;
+    write_u64(node, converted);
+  }
+
+  const size_t de_offset = directededge_offset(*header);
+  const size_t edgeinfo_offset = header->edgeinfo_offset();
+  const size_t edgeinfo_end = std::min<size_t>(header->textlist_offset(), tile_size);
+  const size_t edgeinfo_size = edgeinfo_end > edgeinfo_offset ? edgeinfo_end - edgeinfo_offset : 0;
+  std::vector<bool> converted_edgeinfo(edgeinfo_size, false);
+
+  for (uint32_t i = 0; i < header->directededgecount(); ++i) {
+    char* edge = tile + de_offset + i * sizeof(DirectedEdge);
+
+    const uint64_t word1 = read_u64(edge + 8);
+    const uint64_t edgeinfo = word1 & ((1u << 25) - 1);
+    const uint64_t access_restriction = (word1 >> 25) & 0x7ff;
+    const uint64_t start_restriction = (word1 >> 37) & 0x7ff;
+    const uint64_t end_restriction = (word1 >> 49) & 0xfff;
+    const uint64_t complex_restriction = (word1 >> 61) & 1;
+    const uint64_t dest_only = (word1 >> 62) & 1;
+    const uint64_t not_thru = (word1 >> 63) & 1;
+
+    uint64_t converted1 = edgeinfo;
+    converted1 |= access_restriction << 25;
+    converted1 |= start_restriction << 37;
+    converted1 |= end_restriction << 49;
+    converted1 |= complex_restriction << 61;
+    converted1 |= dest_only << 62;
+    converted1 |= not_thru << 63;
+    write_u64(edge + 8, converted1);
+
+    uint64_t word3 = read_u64(edge + 16);
+    word3 &= ~(0xffull << 8);
+    write_u64(edge + 16, word3);
+
+    if (edgeinfo + sizeof(EdgeInfo::EdgeInfoInner) <= edgeinfo_size &&
+        !converted_edgeinfo[edgeinfo]) {
+      converted_edgeinfo[edgeinfo] = true;
+      char* info = tile + edgeinfo_offset + edgeinfo + 8;
+      const uint32_t word = read_u32(info);
+      const uint32_t name_count = word & 0xf;
+      const uint32_t encoded_shape_size = (word >> 4) & 0xffff;
+      const uint32_t extended_wayid1 = (word >> 20) & 0xff;
+      const uint32_t has_elevation = (word >> 29) & 1;
+      const uint32_t extended_wayid_size = (word >> 30) & 3;
+
+      uint32_t converted = name_count;
+      converted |= encoded_shape_size << 4;
+      converted |= extended_wayid1 << 20;
+      converted |= extended_wayid_size << 28;
+      converted |= has_elevation << 30;
+      write_u32(info, converted);
+    }
+  }
+}
+
+}
 
 graph_tile_ptr GraphTile::DecompressTile(const GraphId& graphid,
                                          const std::vector<char>& compressed) {
@@ -309,7 +468,7 @@ void GraphTile::Initialize(const GraphId& graphid) {
     throw std::runtime_error("Missing tile data");
   }
 
-  char* const tile_ptr = memory_->data;
+  char* tile_ptr = memory_->data;
   const size_t tile_size = memory_->size;
 
   if (tile_size < sizeof(GraphTileHeader)) {
@@ -317,14 +476,22 @@ void GraphTile::Initialize(const GraphId& graphid) {
                              ". Tile file might me corrupted");
   }
 
+  auto* header = reinterpret_cast<GraphTileHeader*>(tile_ptr);
+  if (header->end_offset() != tile_size)
+    throw std::runtime_error("Mismatch in end offset = " + std::to_string(header->end_offset()) +
+                             " vs raw tile data size = " + std::to_string(tile_size) +
+                             ". Tile file might me corrupted");
+
+  if (is_karoo_tile(*header, tile_ptr, tile_size)) {
+    std::vector<char> converted(tile_ptr, tile_ptr + tile_size);
+    convert_karoo_tile(converted.data(), converted.size());
+    memory_ = std::make_unique<VectorGraphMemory>(std::move(converted));
+    tile_ptr = memory_->data;
+  }
+
   char* ptr = tile_ptr;
   header_ = reinterpret_cast<GraphTileHeader*>(ptr);
   ptr += sizeof(GraphTileHeader);
-
-  if (header_->end_offset() != tile_size)
-    throw std::runtime_error("Mismatch in end offset = " + std::to_string(header_->end_offset()) +
-                             " vs raw tile data size = " + std::to_string(tile_size) +
-                             ". Tile file might me corrupted");
 
   if (int current_version = header_->version()[0] - '0'; current_version != VALHALLA_VERSION_MAJOR) {
     LOG_WARN("Tiles were built with version " + std::to_string(current_version) +
